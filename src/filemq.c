@@ -862,15 +862,15 @@ ssize_t write_file_que_timedwait_fifo(const char* filename, void *pdata, size_t 
 	//创建fifo
 	fifo_filename = malloc(strlen(filename) + 6);
 	sprintf(fifo_filename,"%s.fifo",filename);
-	fifofd = open(fifo_filename,O_RDWR);
+	fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
 	if(fifofd == -1){
 		//fifo不存在, 创建fifo
 		//锁文件
 		fcntl(fd,F_SETLKW,&lock);
-		fifofd = open(fifo_filename,O_RDWR);
+		fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
 		if(fifofd == -1){
 			mkfifo(fifo_filename,0664);
-			fifofd = open(fifo_filename,O_RDWR);
+			fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
 		}
 		//解锁文件
 		fcntl(fd,F_SETLKW,&unlock);
@@ -881,9 +881,6 @@ ssize_t write_file_que_timedwait_fifo(const char* filename, void *pdata, size_t 
 		close(fd);
 		return -1;
 	}
-
-	int flag = fcntl(fifofd,F_GETFL);
-	fcntl(fifofd,F_SETFL,flag | O_NONBLOCK);//设置fifo为非阻塞
 
 	//锁文件
 	fcntl(fd,F_SETLKW,&lock);
@@ -966,15 +963,15 @@ ssize_t read_file_que_timedwait_fifo(const char* filename, void *pdata, size_t l
 	//创建fifo
 	fifo_filename = malloc(strlen(filename) + 6);
 	sprintf(fifo_filename,"%s.fifo",filename);
-	fifofd = open(fifo_filename,O_RDWR);
+	fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
 	if(fifofd == -1){
 		//fifo不存在, 创建fifo
 		//锁文件
 		fcntl(fd,F_SETLKW,&lock);
-		fifofd = open(fifo_filename,O_RDWR);
+		fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
 		if(fifofd == -1){
 			mkfifo(fifo_filename,0664);
-			fifofd = open(fifo_filename,O_RDWR);
+			fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
 		}
 		//解锁文件
 		fcntl(fd,F_SETLKW,&unlock);
@@ -985,9 +982,6 @@ ssize_t read_file_que_timedwait_fifo(const char* filename, void *pdata, size_t l
 		close(fd);
 		return -1;
 	}
-
-	int flag = fcntl(fifofd,F_GETFL);
-	fcntl(fifofd,F_SETFL,flag | O_NONBLOCK);//设置fifo为非阻塞
 
 	_localtime(&now);
 	if(timeout < 0){
@@ -1142,15 +1136,15 @@ ssize_t peek_file_que_timedwait_fifo(const char* filename, void *pdata, size_t l
 	//创建fifo
 	fifo_filename = malloc(strlen(filename) + 6);
 	sprintf(fifo_filename,"%s.fifo",filename);
-	fifofd = open(fifo_filename,O_RDWR);
+	fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
 	if(fifofd == -1){
 		//fifo不存在, 创建fifo
 		//锁文件
 		fcntl(fd,F_SETLKW,&lock);
-		fifofd = open(fifo_filename,O_RDWR);
+		fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
 		if(fifofd == -1){
 			mkfifo(fifo_filename,0664);
-			fifofd = open(fifo_filename,O_RDWR);
+			fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
 		}
 		//解锁文件
 		fcntl(fd,F_SETLKW,&unlock);
@@ -1161,9 +1155,6 @@ ssize_t peek_file_que_timedwait_fifo(const char* filename, void *pdata, size_t l
 		close(fd);
 		return -1;
 	}
-
-	int flag = fcntl(fifofd,F_GETFL);
-	fcntl(fifofd,F_SETFL,flag | O_NONBLOCK);//设置fifo为非阻塞
 
 	_localtime(&now);
 	if(timeout < 0){
