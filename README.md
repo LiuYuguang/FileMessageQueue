@@ -21,7 +21,6 @@ sys     0m0.106s
 ```bash
 >> cd /dev/shm/FileMessageQueue
 >> ./bench.sh
-rm: cannot remove ‘tmp’: No such file or directory
 test file_que_inotify_bench #inotify + 记录锁, 单位为微秒
 测试触发延迟, 次数10000, total_count[10000],total_diff[49991065],min_diff[64],max_diff[23151],average_diff[4999]
 测试只写耗时, 次数10000, 耗时331486
