@@ -19,11 +19,15 @@ file_que_sem_bench: file_que_sem_bench.o filemq.o
 file_que_fifo_bench: file_que_fifo_bench.o filemq.o
 	$(CC) -o $@ $^
 
-$(OBJ): obj/%.o : src/%.c
+$(OBJ): obj/%.o : src/%.c obj
 	$(CC) -c $(CFLAGS) -o $@ $< $(INC)
+
+obj:
+	@mkdir -p $@
 
 clean:
 	-rm $(OBJ) $(TARGET)
+	@rmdir obj
 
 .PHONY: all clean 
 
