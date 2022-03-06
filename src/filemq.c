@@ -1,17 +1,17 @@
 #define _GNU_SOURCE
 #include "filemq.h"
-#include <string.h>                //for memcpy
-#include <stdlib.h>                //for malloc free
-#include <errno.h>                 //for errno E*
-#include <fcntl.h>                 //for fcntl
-#include <unistd.h>                //for ftruncate
-#include <sys/stat.h>              //for fstat
-#include <sys/time.h>              //for gettimeofday
-#include <sys/sem.h>               //for semget semop semctl
+#include <string.h>                // for memcpy
+#include <stdlib.h>                // for malloc free
+#include <errno.h>                 // for errno E*
+#include <fcntl.h>                 // for fcntl
+#include <unistd.h>                // for ftruncate
+#include <sys/stat.h>              // for fstat
+#include <sys/time.h>              // for gettimeofday
+#include <sys/sem.h>               // for semget semop semctl
 #include <stdio.h>
-#include <linux/limits.h>
-#include <libgen.h>
-#include <sys/mman.h>
+#include <linux/limits.h>          // for MAX_PATH
+#include <libgen.h>                // for dirname
+#include <sys/mman.h>              // for mmap
 
 typedef struct{
 	size_t head_index;
@@ -37,10 +37,9 @@ union semun
 #define WRITEABLE          (12)
 #define UNWRITEABLE        (10)
 
-#define READ               (-11)
-#define NOREAD             (-9)
-#define WRITE              (-11)
-#define NOWRITE            (-9)
+#define READLOCK           (11)
+#define WRITELOCK          (11)
+#define LOCK               (9)
 
 int makedirs(const char *path){
     //参数错误
@@ -148,8 +147,7 @@ FileMQ *filemq_init(const char* filename,size_t capacity){
 				if(sem_id != -1){
 					// 设置初值, 默认为可读可写
 					unsigned short array[] = {READABLE,WRITEABLE};
-					union semun sem_union;
-					sem_union.array = array;
+					union semun sem_union = {.array = array};
 					semctl(sem_id,0,SETALL,sem_union);
 				}
 			}
@@ -175,7 +173,8 @@ FileMQ *filemq_init(const char* filename,size_t capacity){
 ssize_t write_filemq(FileMQ* filemq,void* pdata,size_t len,int timeout){
 	FileMQHEAD *head = filemq->head;
 	int retu;
-	
+	size_t new_head_index;
+
 	if(sizeof(len) + len > head->capacity){
 		errno = EINVAL;
 		return -1;
@@ -185,15 +184,15 @@ ssize_t write_filemq(FileMQ* filemq,void* pdata,size_t len,int timeout){
 
 	if(timeout < 0){
 		struct sembuf sem_b[2] = {
-			{0,NOREAD,SEM_UNDO},
-			{1,WRITE,SEM_UNDO},
+			{0,-LOCK,SEM_UNDO},
+			{1,-WRITELOCK,SEM_UNDO},
 		};
 
 		retu = semop(filemq->sem_id,sem_b,2);
 	}else if(timeout == 0){
 		struct sembuf sem_b[2] = {
-			{0,NOREAD,SEM_UNDO|IPC_NOWAIT},
-			{1,WRITE,SEM_UNDO|IPC_NOWAIT},
+			{0,-LOCK,SEM_UNDO|IPC_NOWAIT},
+			{1,-WRITELOCK,SEM_UNDO|IPC_NOWAIT},
 		};
 		retu = semop(filemq->sem_id,sem_b,2);
 	}else{
@@ -201,8 +200,8 @@ ssize_t write_filemq(FileMQ* filemq,void* pdata,size_t len,int timeout){
 		ts.tv_sec = timeout/1000;
 		ts.tv_nsec = (timeout%1000)*1000000;
 		struct sembuf sem_b[2] = {
-			{0,NOREAD,SEM_UNDO},
-			{1,WRITE,SEM_UNDO},
+			{0,-LOCK,SEM_UNDO},
+			{1,-WRITELOCK,SEM_UNDO},
 		};
 		retu = semtimedop(filemq->sem_id,sem_b,2,&ts);
 	}
@@ -213,53 +212,54 @@ ssize_t write_filemq(FileMQ* filemq,void* pdata,size_t len,int timeout){
 	if(sizeof(len) + len > head->capacity - ((head->head_index + head->capacity - head->tail_index)%head->capacity)){
 		// 容量不足, 不可写
 		unsigned short array[] = {READABLE,UNWRITEABLE};
-		union semun sem_union;
-		sem_union.array = array;
+		union semun sem_union = {.array = array};
 		semctl(filemq->sem_id,0,SETALL,sem_union);
 		goto start;
 	}
 	
-	if(head->head_index + sizeof(len) > head->capacity){
-		memcpy(&head->data[head->head_index],&len,head->capacity-head->head_index);
-		memcpy(&head->data[0],(unsigned char*)&len + head->capacity-head->head_index,sizeof(len) - (head->capacity-head->head_index));
-		head->head_index = (head->head_index+sizeof(len)) % head->capacity;
+	new_head_index = head->head_index;
+
+	if(new_head_index + sizeof(len) > head->capacity){
+		memcpy(&head->data[new_head_index],&len,head->capacity-new_head_index);
+		memcpy(&head->data[0],(unsigned char*)&len + head->capacity-new_head_index,sizeof(len) - (head->capacity-new_head_index));
+		new_head_index = (new_head_index+sizeof(len)) % head->capacity;
 	}else{
-		memcpy(&head->data[head->head_index],(unsigned char*)&len,sizeof(len));
-		head->head_index = (head->head_index+sizeof(len)) % head->capacity;
+		memcpy(&head->data[new_head_index],(unsigned char*)&len,sizeof(len));
+		new_head_index = (new_head_index+sizeof(len)) % head->capacity;
 	}
 
-	if(head->head_index + len > head->capacity){
-		memcpy(&head->data[head->head_index],pdata,head->capacity-head->head_index);
-		memcpy(&head->data[0],(unsigned char*)pdata + head->capacity-head->head_index,len - (head->capacity-head->head_index));
-		head->head_index = (head->head_index+len) % head->capacity;
+	if(new_head_index + len > head->capacity){
+		memcpy(&head->data[new_head_index],pdata,head->capacity-new_head_index);
+		memcpy(&head->data[0],(unsigned char*)pdata + head->capacity-new_head_index,len - (head->capacity-new_head_index));
+		new_head_index = (new_head_index+len) % head->capacity;
 	}else{
-		memcpy(&head->data[head->head_index],pdata,len);
-		head->head_index = (head->head_index+len) % head->capacity;
+		memcpy(&head->data[new_head_index],pdata,len);
+		new_head_index = (new_head_index+len) % head->capacity;
 	}
+	head->head_index = new_head_index;
 
 	unsigned short array[] = {READABLE,WRITEABLE};
-	union semun sem_union;
-	sem_union.array = array;
+	union semun sem_union = {.array = array};
 	semctl(filemq->sem_id,0,SETALL,sem_union);
 	return len;
 }
 
 ssize_t read_filemq(FileMQ* filemq,void* pdata,size_t size,int timeout){
 	FileMQHEAD *head = filemq->head;
-	size_t len=0;
+	size_t len=0,new_tail_index;
 	int retu;
 
 	start:
 	if(timeout < 0){
 		struct sembuf sem_b[2] = {
-			{0,READ,SEM_UNDO},
-			{1,NOWRITE,SEM_UNDO},
+			{0,-READLOCK,SEM_UNDO},
+			{1,-LOCK,SEM_UNDO},
 		};//p操纵
 		retu = semop(filemq->sem_id,sem_b,2);
 	}else if(timeout == 0){
 		struct sembuf sem_b[2] = {
-			{0,READ,SEM_UNDO|IPC_NOWAIT},
-			{1,NOWRITE,SEM_UNDO|IPC_NOWAIT},
+			{0,-READLOCK,SEM_UNDO|IPC_NOWAIT},
+			{1,-LOCK,SEM_UNDO|IPC_NOWAIT},
 		};//p操纵
 		retu = semop(filemq->sem_id,sem_b,2);
 	}else{
@@ -267,8 +267,8 @@ ssize_t read_filemq(FileMQ* filemq,void* pdata,size_t size,int timeout){
 		ts.tv_sec = timeout/1000;
 		ts.tv_nsec = (timeout%1000)*1000000;
 		struct sembuf sem_b[2] = {
-			{0,READ,SEM_UNDO},
-			{1,NOWRITE,SEM_UNDO},
+			{0,-READLOCK,SEM_UNDO},
+			{1,-LOCK,SEM_UNDO},
 		};//p操纵
 		retu = semtimedop(filemq->sem_id,sem_b,2,&ts);
 	}
@@ -280,49 +280,45 @@ ssize_t read_filemq(FileMQ* filemq,void* pdata,size_t size,int timeout){
 	if(head->head_index == head->tail_index){
 		// 不可读
 		unsigned short array[] = {UNREADABLE,WRITEABLE};
-		union semun sem_union;
-		sem_union.array = array;
+		union semun sem_union = {.array = array};
 		semctl(filemq->sem_id,0,SETALL,sem_union);
 		goto start;
 	}
 
-	size_t i;
-	int j;
-	for(i=head->tail_index,j=0;j<sizeof(len);i=(i+1)%(head->capacity),j++){
-		((unsigned char*)&len)[j] = head->data[i];
+	int i;
+	for(new_tail_index=head->tail_index,i=0;i<sizeof(len);new_tail_index=(new_tail_index+1)%(head->capacity),i++){
+		((unsigned char*)&len)[i] = head->data[new_tail_index];
 	}
 
 	if(len > size){
 		// 数据太长
 		struct sembuf sem_b[2] = {
-			{0,-READ,SEM_UNDO},
-			{1,-NOWRITE,SEM_UNDO},
+			{0,READLOCK,SEM_UNDO},
+			{1,LOCK,SEM_UNDO},
 		};//p操纵
 		semop(filemq->sem_id,sem_b,2);
 		errno = E2BIG;
 		return -1;
 	}
 
-	head->tail_index = (head->tail_index + sizeof(len))%head->capacity;
-
-	if(head->tail_index + len > head->capacity){
-		memcpy(&((unsigned char*)pdata)[0], &head->data[head->tail_index],head->capacity - head->tail_index);
-		memcpy(&((unsigned char*)pdata)[head->capacity - head->tail_index],&head->data[0],len - (head->capacity - head->tail_index));
-		head->tail_index = (head->tail_index + len) % head->capacity;
+	if(new_tail_index + len > head->capacity){
+		memcpy(&((unsigned char*)pdata)[0], &head->data[new_tail_index],head->capacity - new_tail_index);
+		memcpy(&((unsigned char*)pdata)[head->capacity - new_tail_index],&head->data[0],len - (head->capacity - new_tail_index));
+		new_tail_index = (new_tail_index + len) % head->capacity;
 	}else{
-		memcpy(&((unsigned char*)pdata)[0], &head->data[head->tail_index],len);
-		head->tail_index = (head->tail_index + len) % head->capacity;
+		memcpy(&((unsigned char*)pdata)[0], &head->data[new_tail_index],len);
+		new_tail_index = (new_tail_index + len) % head->capacity;
 	}
+	head->tail_index = new_tail_index;
 
 	if(head->head_index == head->tail_index){
 		unsigned short array[] = {UNREADABLE,WRITEABLE};
-		union semun sem_union;
-		sem_union.array = array;
+		union semun sem_union = {.array = array};
 		semctl(filemq->sem_id,0,SETALL,sem_union);
 	}else{
 		struct sembuf sem_b[2] = {
-			{0,-READ,SEM_UNDO},
-			{1,-NOWRITE,SEM_UNDO},
+			{0,READLOCK,SEM_UNDO},
+			{1,LOCK,SEM_UNDO},
 		};//p操纵
 		semop(filemq->sem_id,sem_b,2);
 	}
