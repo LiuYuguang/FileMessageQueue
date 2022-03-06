@@ -6,20 +6,17 @@ OBJ := $(patsubst src/%.c, obj/%.o, $(SRC))
 
 CC     := gcc
 
-TARGET := file_que_inotify_bench file_que_sem_bench file_que_fifo_bench 
+TARGET := client server
 
-all: $(TARGET)
+all: obj $(TARGET)
 
-file_que_inotify_bench: file_que_inotify_bench.o filemq.o
+client: client.o filemq.o
 	$(CC) -o $@ $^
 
-file_que_sem_bench: file_que_sem_bench.o filemq.o
+server: server.o filemq.o
 	$(CC) -o $@ $^
 
-file_que_fifo_bench: file_que_fifo_bench.o filemq.o
-	$(CC) -o $@ $^
-
-$(OBJ): obj/%.o : src/%.c obj
+$(OBJ): obj/%.o : src/%.c
 	$(CC) -c $(CFLAGS) -o $@ $< $(INC)
 
 obj:

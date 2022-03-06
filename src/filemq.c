@@ -2,1276 +2,330 @@
 #include "filemq.h"
 #include <string.h>                //for memcpy
 #include <stdlib.h>                //for malloc free
-#include <signal.h>                //for signal sigset_t sigfillset pthread_sigmask SIG*
 #include <errno.h>                 //for errno E*
-#include <unistd.h>                //for alarm
-#include <sys/inotify.h>           //for inotify
 #include <fcntl.h>                 //for fcntl
 #include <unistd.h>                //for ftruncate
 #include <sys/stat.h>              //for fstat
 #include <sys/time.h>              //for gettimeofday
 #include <sys/sem.h>               //for semget semop semctl
 #include <stdio.h>
-
-#define FILE_QUE_HEAD_SIZE 4096
-#define FILE_QUE_BODY_SIZE 4096
+#include <linux/limits.h>
+#include <libgen.h>
+#include <sys/mman.h>
 
 typedef struct{
 	size_t head_index;
 	size_t tail_index;
-}file_que_head;
+    size_t capacity;
+    unsigned char data[0];
+}FileMQHEAD;
 
-typedef struct{
-	size_t length;
-	unsigned char data[0];
-}file_que_body;
-
-static void _localtime(uint64_t *t){
-    struct timeval tv;
-    gettimeofday(&tv,NULL);
-    *t = tv.tv_sec*1000000 + tv.tv_usec;
-}
-
-///////////////////////////////以下是inotify////////////////////////////////////////////////////////////
-ssize_t write_file_que_timedwait_inotify(const char* filename, void *pdata, size_t len, int timeout){
-	struct flock lock = {F_WRLCK,SEEK_SET,0,0};
-	struct flock unlock = {F_UNLCK,SEEK_SET,0,0};
-
-	ssize_t retu = -1;
-	struct stat filestat;
-	file_que_head *que_head;
-	file_que_body *que_body;
-	unsigned char head_buf[FILE_QUE_HEAD_SIZE] = {0};
-	unsigned char body_buf[FILE_QUE_BODY_SIZE] = {0};
-	que_head = (file_que_head*)head_buf;
-	que_body = (file_que_body*)body_buf;
-	int fd;
-
-	if(filename == NULL){
-		return -1;
-	}
-
-	//pdata太长
-	if(len > FILE_QUE_BODY_SIZE-sizeof(file_que_body)){
-		return -1;
-	}
-	
-	fd = open(filename,O_RDWR|O_CREAT,0664);
-	if(fd == -1)
-		return -1;
-
-	//锁文件
-	fcntl(fd,F_SETLKW,&lock);
-	//文件长度
-	fstat(fd,&filestat);
-	//读头
-	if(filestat.st_size >= FILE_QUE_HEAD_SIZE){
-		lseek(fd,0,SEEK_SET);
-		read(fd,head_buf,FILE_QUE_HEAD_SIZE);
-	}
-	//脏文件,清空
-	if(filestat.st_size<FILE_QUE_HEAD_SIZE 
-		||que_head->head_index<que_head->tail_index 
-		|| FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE != filestat.st_size
-	){
-		que_head->head_index = que_head->tail_index = 0;
-		//ftruncate(fd,0);
-	}
-	//追加数据
-	que_body->length = len;
-	memcpy(que_body->data,pdata,len);
-	retu = lseek(fd,FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE,SEEK_SET);
-	if(retu == -1){
-		retu = -1;
-		goto finish;
-	}
-	retu = write(fd,body_buf,FILE_QUE_BODY_SIZE);
-	if(retu == -1){
-		retu = -1;
-		goto finish;
-	}
-	//更新头
-	que_head->head_index++;
-	lseek(fd,0,SEEK_SET);
-	retu = write(fd,head_buf,FILE_QUE_HEAD_SIZE);
-	if(retu == -1){
-		retu = -1;
-		goto finish;
-	}
-	retu = len;
-
-	finish:
-	//解锁
-	fcntl(fd,F_SETLKW,&unlock);
-	close(fd);
-	return retu;
-}
-
-ssize_t read_file_que_timedwait_inotify(const char* filename, void *pdata, size_t len, int timeout){
-	struct flock lock = {F_WRLCK,SEEK_SET,0,0};
-	struct flock unlock = {F_UNLCK,SEEK_SET,0,0};
-
-	ssize_t retu = -1;
-	struct stat filestat;
-	file_que_head *que_head;
-	file_que_body *que_body;
-	unsigned char head_buf[FILE_QUE_HEAD_SIZE] = {0};
-	unsigned char body_buf[FILE_QUE_BODY_SIZE] = {0};
-	que_head = (file_que_head*)head_buf;
-	que_body = (file_que_body*)body_buf;
-	int fd,inotify_fd,inotify_wd;
-	uint64_t now,expire;
-
-	if(filename == NULL){
-		return -1;
-	}
-
-	fd = open(filename,O_RDWR|O_CREAT,0664);
-	if(fd == -1){
-		return -1;
-	}
-	//创建inotify
-	inotify_fd = inotify_init();
-
-	_localtime(&now);
-	
-	if(timeout < 0){
-		expire = -1;
-	}else{
-		expire = now + timeout * 1000000;
-	}
-	
-	while(now <= expire){
-		memset(head_buf,0,sizeof(head_buf));
-		//加锁
-		fcntl(fd,F_SETLKW,&lock);
-		//文件长度
-		fstat(fd,&filestat);
-		//读头
-		if(filestat.st_size >= FILE_QUE_HEAD_SIZE){
-			lseek(fd,0,SEEK_SET);
-			read(fd,head_buf,FILE_QUE_HEAD_SIZE);
-		}
-		//脏文件,清空
-		if(filestat.st_size<FILE_QUE_HEAD_SIZE 
-			||que_head->head_index<que_head->tail_index 
-			|| FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE != filestat.st_size
-		){
-			que_head->head_index = que_head->tail_index = 0;
-			ftruncate(fd,0);
-		}
-		//有数据
-		if(que_head->head_index > que_head->tail_index){
-			//先偏移
-			retu = lseek(fd,FILE_QUE_HEAD_SIZE + que_head->tail_index * FILE_QUE_BODY_SIZE,SEEK_SET);
-			if(retu == -1){
-				retu = -1;
-				break;
-			}
-			//有数据
-			while(que_head->head_index > que_head->tail_index){
-				retu = read(fd,body_buf,FILE_QUE_BODY_SIZE);
-				if(retu == -1){
-					retu = -1;
-					break;
-				}
-				if(retu != FILE_QUE_BODY_SIZE){
-					retu = -1;
-					break;
-				}
-				if(que_body->length > FILE_QUE_BODY_SIZE-sizeof(file_que_head)){
-					//脏数据, 继续读
-					retu = -1;
-					que_head->tail_index++;
-					continue;
-				}
-				if(que_body->length > len){
-					//pdata不够长
-					retu = -1;
-					errno = E2BIG;
-					break;
-				}
-				memcpy(pdata,que_body->data,que_body->length);
-
-				que_head->tail_index++;
-				if(que_head->head_index == que_head->tail_index){
-					//队列为空, 清空文件
-					que_head->head_index = que_head->tail_index = 0;
-					ftruncate(fd,0);
-				}else{
-					lseek(fd,0,SEEK_SET);
-					retu = write(fd,head_buf,FILE_QUE_HEAD_SIZE);
-					if(retu == -1){
-						retu = -1;
-						break;
-					}
-				}
-				retu = que_body->length;
-				break;
-			}
-		}
-		//解锁
-		fcntl(fd,F_SETLKW,&unlock);
-
-		//取到数据或者读数据有某些问题的，可以返回了
-		if(retu >= 0 || que_head->head_index > que_head->tail_index){
-			break;
-		}
-		//队列为空
-		if(now >= expire){
-			retu = -1;
-			break;
-		}
-
-		//无数据,则用inotify等待文件写入
-		struct timeval tv,*tv_p;
-		if(timeout<0){
-			tv_p = NULL;
-		}else{
-			tv_p = &tv;
-			tv_p->tv_sec = (expire - now) / 1000000;
-			tv_p->tv_usec = (expire - now) % 1000000;
-		}
-		
-		inotify_wd = inotify_add_watch(inotify_fd, filename, IN_OPEN|IN_MODIFY);
-		//struct inotify_event event;
-		
-		fd_set rset;
-		FD_ZERO(&rset);
-		FD_SET(inotify_fd,&rset);
-		int n = select(inotify_fd+1,&rset,NULL,NULL,tv_p);
-
-		if(n == 0){
-			//timeout
-			errno = ETIME;
-			retu = -1;
-			break;
-		}else if(n == -1){
-			//signal or other
-			retu = -1;
-			break;
-		}else{
-			//继续读文件
-		}
-		inotify_rm_watch(fd, inotify_wd); 
-		_localtime(&now);
-	}
-	close(fd);
-	close(inotify_fd);
-	return retu;
-}
-
-ssize_t peek_file_que_timedwait_inotify(const char* filename, void *pdata, size_t len, int timeout){
-	struct flock lock = {F_WRLCK,SEEK_SET,0,0};
-	struct flock unlock = {F_UNLCK,SEEK_SET,0,0};
-
-	ssize_t retu = -1;
-	struct stat filestat;
-	file_que_head *que_head;
-	file_que_body *que_body;
-	unsigned char head_buf[FILE_QUE_HEAD_SIZE] = {0};
-	unsigned char body_buf[FILE_QUE_BODY_SIZE] = {0};
-	que_head = (file_que_head*)head_buf;
-	que_body = (file_que_body*)body_buf;
-	int fd,inotify_fd,inotify_wd;
-	uint64_t now,expire;
-
-	if(filename == NULL){
-		return -1;
-	}
-
-	fd = open(filename,O_RDWR|O_CREAT,0664);
-	if(fd == -1){
-		return -1;
-	}
-	//创建inotify
-	inotify_fd = inotify_init();
-
-	_localtime(&now);
-	
-	if(timeout < 0){
-		expire = -1;
-	}else{
-		expire = now + timeout * 1000000;
-	}
-	
-	while(now <= expire){
-		memset(head_buf,0,sizeof(head_buf));
-		//加锁
-		fcntl(fd,F_SETLKW,&lock);
-		//文件长度
-		fstat(fd,&filestat);
-		//读头
-		if(filestat.st_size >= FILE_QUE_HEAD_SIZE){
-			lseek(fd,0,SEEK_SET);
-			read(fd,head_buf,FILE_QUE_HEAD_SIZE);
-		}
-		//脏文件,清空
-		if(filestat.st_size<FILE_QUE_HEAD_SIZE 
-			||que_head->head_index<que_head->tail_index 
-			|| FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE != filestat.st_size
-		){
-			que_head->head_index = que_head->tail_index = 0;
-			ftruncate(fd,0);
-		}
-		//有数据
-		size_t tail_index_old = que_head->tail_index;
-		if(que_head->head_index > que_head->tail_index){
-			//先偏移
-			retu = lseek(fd,FILE_QUE_HEAD_SIZE + que_head->tail_index * FILE_QUE_BODY_SIZE,SEEK_SET);
-			if(retu == -1){
-				retu = -1;
-				break;
-			}
-			//有数据
-			while(que_head->head_index > que_head->tail_index){
-				retu = read(fd,body_buf,FILE_QUE_BODY_SIZE);
-				if(retu == -1){
-					retu = -1;
-					break;
-				}
-				if(retu != FILE_QUE_BODY_SIZE){
-					retu = -1;
-					break;
-				}
-				if(que_body->length > FILE_QUE_BODY_SIZE-sizeof(file_que_head)){
-					//脏数据, 继续读
-					retu = -1;
-					que_head->tail_index++;
-					continue;
-				}
-				if(que_body->length > len){
-					//pdata不够长
-					retu = -1;
-					errno = E2BIG;
-					break;
-				}
-				memcpy(pdata,que_body->data,que_body->length);
-				if(tail_index_old != que_head->tail_index){
-					lseek(fd,0,SEEK_SET);
-					retu = write(fd,head_buf,FILE_QUE_HEAD_SIZE);
-					if(retu == -1){
-						retu = -1;
-						break;
-					}
-				}
-				retu = que_body->length;
-				break;
-			}
-		}
-		//解锁
-		fcntl(fd,F_SETLKW,&unlock);
-
-		//取到数据或者读数据有某些问题的，可以返回了
-		if(retu >= 0 || que_head->head_index > que_head->tail_index){
-			break;
-		}
-		//队列为空
-		if(now >= expire){
-			retu = -1;
-			break;
-		}
-
-		//无数据,则用inotify等待文件写入
-		struct timeval tv,*tv_p;
-		if(expire == -1){
-			tv_p = NULL;
-		}else{
-			tv_p = &tv;
-			tv_p->tv_sec = (expire - now) / 1000000;
-			tv_p->tv_usec = (expire - now) % 1000000;
-		}
-		inotify_wd = inotify_add_watch(inotify_fd, filename, IN_OPEN|IN_MODIFY);
-		//struct inotify_event event;
-		
-		fd_set rset;
-		FD_ZERO(&rset);
-		FD_SET(inotify_fd,&rset);
-		int n = select(inotify_fd+1,&rset,NULL,NULL,tv_p);
-
-		if(n == 0){
-			//timeout
-			errno = ETIME;
-			retu = -1;
-			break;
-		}else if(n == -1){
-			//signal
-			retu = -1;
-			break;
-		}else{
-			//继续读文件
-		}
-		inotify_rm_watch(fd, inotify_wd); 
-		_localtime(&now);
-
-	}
-	close(fd);
-	close(inotify_fd);
-	return retu;
-}
-///////////////////////////////以上是inotify////////////////////////////////////////////////////////////
-
-///////////////////////////////以下是信号量////////////////////////////////////////////////////////////
-
-#define    HAVETRANS    30
-#define    NOTRANS      20
-#define    WRITETRANS   -18
-#define    READTRANS    -25
+typedef struct _FileMQ{
+    int sem_id;
+    FileMQHEAD *head;
+}FileMQ;
 
 union semun
 {
-	int val;
-	struct semid_ds *buf;
-	unsigned short *arry;
+	int val;                /* for SETVAL */
+	struct semid_ds *buf;   /* for IPC_STAT and IPC_SET */
+	unsigned short *array;  /* for GETALL and SETALL */
 };
 
-ssize_t write_file_que_timedwait_sem(const char* filename, void *pdata, size_t len, int timeout){
+#define READABLE           (12)
+#define UNREADABLE         (10)
+#define WRITEABLE          (12)
+#define UNWRITEABLE        (10)
+
+#define READ               (-11)
+#define NOREAD             (-9)
+#define WRITE              (-11)
+#define NOWRITE            (-9)
+
+int makedirs(const char *path){
+    //参数错误
+    if(path == NULL){
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct stat file_stat;
+    //路径存在
+    if(stat(path,&file_stat) == 0 && S_ISDIR(file_stat.st_mode)){
+        return 0;
+    }
+
+	char path_tmp[PATH_MAX+1]={0},path_total[PATH_MAX+1]={0};
+    char *index;
+
+    if(strlen(path) > PATH_MAX){
+        errno = E2BIG;
+        return -1;
+    }
+    strcpy(path_tmp,path);
+
+    if(path_tmp[0] == '/'){
+        strcat(path_total,"/");
+    }
+    
+	for(index = strtok(path_tmp,"/");index!=NULL;index=strtok(NULL,"/")){
+        strcat(path_total,index);
+        strcat(path_total,"/");
+        if(stat(path_total,&file_stat) == 0){
+            if(S_ISDIR(file_stat.st_mode)){
+                //路径存在
+                continue;
+            }
+            else{
+                //其他类型文件
+                return -1;
+            }
+        }
+
+        if(mkdir(path_total,0775) == -1){
+            return -1;
+        }
+    }
+    return 0;
+}
+
+FileMQ *filemq_init(const char* filename,size_t capacity){
 	struct flock lock = {F_WRLCK,SEEK_SET,0,0};
 	struct flock unlock = {F_UNLCK,SEEK_SET,0,0};
-
-	ssize_t retu = -1;
-	struct stat filestat;
-	file_que_head *que_head;
-	file_que_body *que_body;
-	unsigned char head_buf[FILE_QUE_HEAD_SIZE] = {0};
-	unsigned char body_buf[FILE_QUE_BODY_SIZE] = {0};
-	que_head = (file_que_head*)head_buf;
-	que_body = (file_que_body*)body_buf;
-	int fd,sem_id;
+	int fd = -1,sem_id;
 	key_t sem_key;
-	union semun sem_union;
-	struct sembuf sem_b = {0,WRITETRANS,SEM_UNDO};//p操纵
+	struct stat file_stat;
+	FileMQHEAD *head=NULL;
 
-	if(filename == NULL){
-		return -1;
+	if(filename == NULL || strlen(filename) > PATH_MAX){
+		errno = EINVAL;
+		return NULL;
 	}
 
-	//pdata太长
-	if(len > FILE_QUE_BODY_SIZE-sizeof(file_que_body)){
-		return -1;
+	fd = open(filename,O_RDWR|O_CREAT,0664);
+	if(fd == -1){
+		char file_path[PATH_MAX+1]={0};
+		strcpy(file_path,filename);
+		//创建路径
+        if(makedirs(dirname(file_path)) == -1){
+            return NULL;
+        }
+		fd = open(filename,O_RDWR|O_CREAT,0664);
+		if(fd == -1){
+			return NULL;
+		}
+
+	}
+	fstat(fd,&file_stat);
+	if(file_stat.st_size <= sizeof(FileMQHEAD)){
+		if(ftruncate(fd,sizeof(FileMQHEAD) + capacity) == -1){
+			close(fd);
+			return NULL;
+		}
+		file_stat.st_size = sizeof(FileMQHEAD) + capacity;
+	}
+
+	if((head = mmap(NULL,file_stat.st_size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0)) == MAP_FAILED){
+		close(fd);
+		return NULL;
+	}
+
+	if(file_stat.st_size != sizeof(FileMQHEAD) + head->capacity){
+		head->head_index = head->tail_index = 0;
+		head->capacity = file_stat.st_size - sizeof(FileMQHEAD);
 	}
 	
-	fd = open(filename,O_RDWR|O_CREAT,0664);
-	if(fd == -1)
-		return -1;
-
 	sem_key = ftok(filename,1);
-	sem_id = semget(sem_key,1,0664);
+	sem_id = semget(sem_key,0,0664);
 	if(sem_id == -1){
-		//信号量不存在, 创建信号量
+		// 信号量不存在, 创建信号量
 		if(errno == ENOENT){
 			//锁文件
 			fcntl(fd,F_SETLKW,&lock);
-			sem_id = semget(sem_key,1,0664);
+			sem_id = semget(sem_key,0,0664);
 			if(sem_id == -1 && errno == ENOENT){
-				sem_id = semget(sem_key,1,0664|IPC_CREAT);
+				sem_id = semget(sem_key,2,0664|IPC_CREAT);
 				if(sem_id != -1){
-					//设置初值
-					sem_union.val = NOTRANS;
-					semctl(sem_id,0,SETVAL,sem_union);
+					// 设置初值, 默认为可读可写
+					unsigned short array[] = {READABLE,WRITEABLE};
+					union semun sem_union;
+					sem_union.array = array;
+					semctl(sem_id,0,SETALL,sem_union);
 				}
 			}
 			//解锁文件
 			fcntl(fd,F_SETLKW,&unlock);
 		}
 	}
+
 	if(sem_id  == -1){
 		close(fd);
+		munmap(head,file_stat.st_size);
+		return NULL;
+	}
+
+	FileMQ *filemq = malloc(sizeof(FileMQ));
+	filemq->sem_id = sem_id;
+	filemq->head = head;
+	close(fd);
+
+	return filemq;
+}
+
+ssize_t write_filemq(FileMQ* filemq,void* pdata,size_t len,int timeout){
+	FileMQHEAD *head = filemq->head;
+	int retu;
+	
+	if(sizeof(len) + len > head->capacity){
+		errno = EINVAL;
 		return -1;
 	}
 
+	start:
+
 	if(timeout < 0){
-		retu = semop(sem_id,&sem_b,1);
+		struct sembuf sem_b[2] = {
+			{0,NOREAD,SEM_UNDO},
+			{1,WRITE,SEM_UNDO},
+		};
+
+		retu = semop(filemq->sem_id,sem_b,2);
 	}else if(timeout == 0){
-		sem_b.sem_flg |= IPC_NOWAIT;
-		retu = semop(sem_id,&sem_b,1);
+		struct sembuf sem_b[2] = {
+			{0,NOREAD,SEM_UNDO|IPC_NOWAIT},
+			{1,WRITE,SEM_UNDO|IPC_NOWAIT},
+		};
+		retu = semop(filemq->sem_id,sem_b,2);
 	}else{
 		struct timespec ts;
 		ts.tv_sec = timeout/1000;
 		ts.tv_nsec = (timeout%1000)*1000000;
-		retu = semtimedop(sem_id,&sem_b,1,&ts);
+		struct sembuf sem_b[2] = {
+			{0,NOREAD,SEM_UNDO},
+			{1,WRITE,SEM_UNDO},
+		};
+		retu = semtimedop(filemq->sem_id,sem_b,2,&ts);
 	}
 	if(retu == -1){
-		close(fd);
 		return retu;
 	}
+	
+	if(sizeof(len) + len > head->capacity - ((head->head_index + head->capacity - head->tail_index)%head->capacity)){
+		// 容量不足, 不可写
+		unsigned short array[] = {READABLE,UNWRITEABLE};
+		union semun sem_union;
+		sem_union.array = array;
+		semctl(filemq->sem_id,0,SETALL,sem_union);
+		goto start;
+	}
+	
+	if(head->head_index + sizeof(len) > head->capacity){
+		memcpy(&head->data[head->head_index],&len,head->capacity-head->head_index);
+		memcpy(&head->data[0],(unsigned char*)&len + head->capacity-head->head_index,sizeof(len) - (head->capacity-head->head_index));
+		head->head_index = (head->head_index+sizeof(len)) % head->capacity;
+	}else{
+		memcpy(&head->data[head->head_index],(unsigned char*)&len,sizeof(len));
+		head->head_index = (head->head_index+sizeof(len)) % head->capacity;
+	}
 
-	//文件长度
-	fstat(fd,&filestat);
-	//读头
-	if(filestat.st_size >= FILE_QUE_HEAD_SIZE){
-		lseek(fd,0,SEEK_SET);
-		read(fd,head_buf,FILE_QUE_HEAD_SIZE);
+	if(head->head_index + len > head->capacity){
+		memcpy(&head->data[head->head_index],pdata,head->capacity-head->head_index);
+		memcpy(&head->data[0],(unsigned char*)pdata + head->capacity-head->head_index,len - (head->capacity-head->head_index));
+		head->head_index = (head->head_index+len) % head->capacity;
+	}else{
+		memcpy(&head->data[head->head_index],pdata,len);
+		head->head_index = (head->head_index+len) % head->capacity;
 	}
-	//脏文件,清空
-	if(filestat.st_size<FILE_QUE_HEAD_SIZE 
-		||que_head->head_index<que_head->tail_index 
-		|| FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE != filestat.st_size
-	){
-		que_head->head_index = que_head->tail_index = 0;
-		//ftruncate(fd,0);
-	}
-	//追加数据
-	que_body->length = len;
-	memcpy(que_body->data,pdata,len);
-	retu = lseek(fd,FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE,SEEK_SET);
-	if(retu == -1){
-		retu = -1;
-		goto finish;
-	}
-	retu = write(fd,body_buf,FILE_QUE_BODY_SIZE);
-	if(retu == -1){
-		retu = -1;
-		goto finish;
-	}
-	//更新头
-	que_head->head_index++;
-	lseek(fd,0,SEEK_SET);
-	retu = write(fd,head_buf,FILE_QUE_HEAD_SIZE);
-	if(retu == -1){
-		retu = -1;
-		goto finish;
-	}
-	retu = len;
 
-	finish:
-	//解锁
-	sem_union.val = HAVETRANS;
-	semctl(sem_id,0,SETVAL,sem_union);
-	close(fd);
-	return retu;
-}
-
-ssize_t read_file_que_timedwait_sem(const char* filename, void *pdata, size_t len, int timeout){
-	struct flock lock = {F_WRLCK,SEEK_SET,0,0};
-	struct flock unlock = {F_UNLCK,SEEK_SET,0,0};
-
-	ssize_t retu = -1;
-	struct stat filestat;
-	file_que_head *que_head;
-	file_que_body *que_body;
-	unsigned char head_buf[FILE_QUE_HEAD_SIZE] = {0};
-	unsigned char body_buf[FILE_QUE_BODY_SIZE] = {0};
-	que_head = (file_que_head*)head_buf;
-	que_body = (file_que_body*)body_buf;
-	int fd,sem_id;
-	key_t sem_key;
+	unsigned short array[] = {READABLE,WRITEABLE};
 	union semun sem_union;
-	struct sembuf sem_b = {0,READTRANS,SEM_UNDO};//p操纵
+	sem_union.array = array;
+	semctl(filemq->sem_id,0,SETALL,sem_union);
+	return len;
+}
 
-	if(filename == NULL){
-		return -1;
-	}
+ssize_t read_filemq(FileMQ* filemq,void* pdata,size_t size,int timeout){
+	FileMQHEAD *head = filemq->head;
+	size_t len=0;
+	int retu;
 
-	fd = open(filename,O_RDWR|O_CREAT,0664);
-	if(fd == -1){
-		return -1;
-	}
-
-	sem_key = ftok(filename,1);
-	sem_id = semget(sem_key,1,0664);
-	if(sem_id == -1){
-		//信号量不存在, 创建信号量
-		if(errno == ENOENT){
-			//锁文件
-			fcntl(fd,F_SETLKW,&lock);
-			sem_id = semget(sem_key,1,0664);
-			if(sem_id == -1 && errno == ENOENT){
-				sem_id = semget(sem_key,1,0664|IPC_CREAT);
-				if(sem_id != -1){
-					//设置初值
-					sem_union.val = NOTRANS;
-					semctl(sem_id,0,SETVAL,sem_union);
-				}
-			}
-			//解锁文件
-			fcntl(fd,F_SETLKW,&unlock);
-		}
-	}
-	if(sem_id  == -1){
-		close(fd);
-		return -1;
-	}
-	
+	start:
 	if(timeout < 0){
-		retu = semop(sem_id,&sem_b,1);
+		struct sembuf sem_b[2] = {
+			{0,READ,SEM_UNDO},
+			{1,NOWRITE,SEM_UNDO},
+		};//p操纵
+		retu = semop(filemq->sem_id,sem_b,2);
 	}else if(timeout == 0){
-		sem_b.sem_flg |= IPC_NOWAIT;
-		retu = semop(sem_id,&sem_b,1);
+		struct sembuf sem_b[2] = {
+			{0,READ,SEM_UNDO|IPC_NOWAIT},
+			{1,NOWRITE,SEM_UNDO|IPC_NOWAIT},
+		};//p操纵
+		retu = semop(filemq->sem_id,sem_b,2);
 	}else{
 		struct timespec ts;
 		ts.tv_sec = timeout/1000;
 		ts.tv_nsec = (timeout%1000)*1000000;
-		retu = semtimedop(sem_id,&sem_b,1,&ts);
+		struct sembuf sem_b[2] = {
+			{0,READ,SEM_UNDO},
+			{1,NOWRITE,SEM_UNDO},
+		};//p操纵
+		retu = semtimedop(filemq->sem_id,sem_b,2,&ts);
 	}
+
 	if(retu == -1){
-		close(fd);
 		return retu;
 	}
-	
-	//文件长度
-	fstat(fd,&filestat);
-	//读头
-	if(filestat.st_size >= FILE_QUE_HEAD_SIZE){
-		lseek(fd,0,SEEK_SET);
-		read(fd,head_buf,FILE_QUE_HEAD_SIZE);
-	}
-	//脏文件,清空
-	if(filestat.st_size<FILE_QUE_HEAD_SIZE 
-		||que_head->head_index<que_head->tail_index 
-		|| FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE != filestat.st_size
-	){
-		que_head->head_index = que_head->tail_index = 0;
-		ftruncate(fd,0);
-	}
-	//有数据
-	if(que_head->head_index > que_head->tail_index){
-		//先偏移
-		retu = lseek(fd,FILE_QUE_HEAD_SIZE + que_head->tail_index * FILE_QUE_BODY_SIZE,SEEK_SET);
-		if(retu == -1){
-			retu = -1;
-			goto finish;
-		}
-		//有数据
-		while(que_head->head_index > que_head->tail_index){
-			retu = read(fd,body_buf,FILE_QUE_BODY_SIZE);
-			if(retu == -1){
-				retu = -1;
-				break;
-			}
-			if(retu != FILE_QUE_BODY_SIZE){
-				retu = -1;
-				break;
-			}
-			if(que_body->length > FILE_QUE_BODY_SIZE-sizeof(file_que_head)){
-				//脏数据, 继续读
-				retu = -1;
-				que_head->tail_index++;
-				continue;
-			}
-			if(que_body->length > len){
-				//pdata不够长
-				retu = -1;
-				errno = E2BIG;
-				break;
-			}
-			memcpy(pdata,que_body->data,que_body->length);
 
-			que_head->tail_index++;
-			if(que_head->head_index == que_head->tail_index){
-				//队列为空, 清空文件
-				que_head->head_index = que_head->tail_index = 0;
-				ftruncate(fd,0);
-			}else{
-				lseek(fd,0,SEEK_SET);
-				retu = write(fd,head_buf,FILE_QUE_HEAD_SIZE);
-				if(retu == -1){
-					retu = -1;
-					break;
-				}
-			}
-			retu = que_body->length;
-			break;
-		}
+	if(head->head_index == head->tail_index){
+		// 不可读
+		unsigned short array[] = {UNREADABLE,WRITEABLE};
+		union semun sem_union;
+		sem_union.array = array;
+		semctl(filemq->sem_id,0,SETALL,sem_union);
+		goto start;
 	}
-	
-	finish:
-	if(que_head->head_index > que_head->tail_index){
-		sem_union.val = HAVETRANS;
-		semctl(sem_id,0,SETVAL,sem_union);
+
+	size_t i;
+	int j;
+	for(i=head->tail_index,j=0;j<sizeof(len);i=(i+1)%(head->capacity),j++){
+		((unsigned char*)&len)[j] = head->data[i];
+	}
+
+	if(len > size){
+		// 数据太长
+		struct sembuf sem_b[2] = {
+			{0,-READ,SEM_UNDO},
+			{1,-NOWRITE,SEM_UNDO},
+		};//p操纵
+		semop(filemq->sem_id,sem_b,2);
+		errno = E2BIG;
+		return -1;
+	}
+
+	head->tail_index = (head->tail_index + sizeof(len))%head->capacity;
+
+	if(head->tail_index + len > head->capacity){
+		memcpy(&((unsigned char*)pdata)[0], &head->data[head->tail_index],head->capacity - head->tail_index);
+		memcpy(&((unsigned char*)pdata)[head->capacity - head->tail_index],&head->data[0],len - (head->capacity - head->tail_index));
+		head->tail_index = (head->tail_index + len) % head->capacity;
 	}else{
-		sem_union.val = NOTRANS;
-	}
-	semctl(sem_id,0,SETVAL,sem_union);
-
-	close(fd);
-	return retu;
-}
-
-ssize_t peek_file_que_timedwait_sem(const char* filename, void *pdata, size_t len, int timeout){
-	struct flock lock = {F_WRLCK,SEEK_SET,0,0};
-	struct flock unlock = {F_UNLCK,SEEK_SET,0,0};
-
-	ssize_t retu = -1;
-	struct stat filestat;
-	file_que_head *que_head;
-	file_que_body *que_body;
-	unsigned char head_buf[FILE_QUE_HEAD_SIZE] = {0};
-	unsigned char body_buf[FILE_QUE_BODY_SIZE] = {0};
-	que_head = (file_que_head*)head_buf;
-	que_body = (file_que_body*)body_buf;
-	int fd,sem_id;
-	key_t sem_key;
-	union semun sem_union;
-	struct sembuf sem_b = {0,READTRANS,SEM_UNDO};//p操纵
-
-	if(filename == NULL){
-		return -1;
+		memcpy(&((unsigned char*)pdata)[0], &head->data[head->tail_index],len);
+		head->tail_index = (head->tail_index + len) % head->capacity;
 	}
 
-	fd = open(filename,O_RDWR|O_CREAT,0664);
-	if(fd == -1){
-		return -1;
-	}
-
-	sem_key = ftok(filename,1);
-	sem_id = semget(sem_key,1,0664);
-	if(sem_id == -1){
-		//信号量不存在, 创建信号量
-		if(errno == ENOENT){
-			//锁文件
-			fcntl(fd,F_SETLKW,&lock);
-			sem_id = semget(sem_key,1,0664);
-			if(sem_id == -1 && errno == ENOENT){
-				sem_id = semget(sem_key,1,0664|IPC_CREAT);
-				if(sem_id != -1){
-					//设置初值
-					sem_union.val = NOTRANS;
-					semctl(sem_id,0,SETVAL,sem_union);
-				}
-			}
-			//解锁文件
-			fcntl(fd,F_SETLKW,&unlock);
-		}
-	}
-	if(sem_id  == -1){
-		close(fd);
-		return -1;
-	}
-	
-	if(timeout < 0){
-		retu = semop(sem_id,&sem_b,1);
-	}else if(timeout == 0){
-		sem_b.sem_flg |= IPC_NOWAIT;
-		retu = semop(sem_id,&sem_b,1);
+	if(head->head_index == head->tail_index){
+		unsigned short array[] = {UNREADABLE,WRITEABLE};
+		union semun sem_union;
+		sem_union.array = array;
+		semctl(filemq->sem_id,0,SETALL,sem_union);
 	}else{
-		struct timespec ts;
-		ts.tv_sec = timeout/1000;
-		ts.tv_nsec = (timeout%1000)*1000000;
-		retu = semtimedop(sem_id,&sem_b,1,&ts);
+		struct sembuf sem_b[2] = {
+			{0,-READ,SEM_UNDO},
+			{1,-NOWRITE,SEM_UNDO},
+		};//p操纵
+		semop(filemq->sem_id,sem_b,2);
 	}
-	if(retu == -1){
-		close(fd);
-		return retu;
-	}
-	
-	//文件长度
-	fstat(fd,&filestat);
-	//读头
-	if(filestat.st_size >= FILE_QUE_HEAD_SIZE){
-		lseek(fd,0,SEEK_SET);
-		read(fd,head_buf,FILE_QUE_HEAD_SIZE);
-	}
-	//脏文件,清空
-	if(filestat.st_size<FILE_QUE_HEAD_SIZE 
-		||que_head->head_index<que_head->tail_index 
-		|| FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE != filestat.st_size
-	){
-		que_head->head_index = que_head->tail_index = 0;
-		ftruncate(fd,0);
-	}
-	//有数据
-	if(que_head->head_index > que_head->tail_index){
-		//先偏移
-		retu = lseek(fd,FILE_QUE_HEAD_SIZE + que_head->tail_index * FILE_QUE_BODY_SIZE,SEEK_SET);
-		if(retu == -1){
-			retu = -1;
-			goto finish;
-		}
-		//有数据
-		size_t tail_index_old = que_head->tail_index;
-		while(que_head->head_index > que_head->tail_index){
-			retu = read(fd,body_buf,FILE_QUE_BODY_SIZE);
-			if(retu == -1){
-				retu = -1;
-				break;
-			}
-			if(retu != FILE_QUE_BODY_SIZE){
-				retu = -1;
-				break;
-			}
-			if(que_body->length > FILE_QUE_BODY_SIZE-sizeof(file_que_head)){
-				//脏数据, 继续读
-				retu = -1;
-				que_head->tail_index++;
-				continue;
-			}
-			if(que_body->length > len){
-				//pdata不够长
-				retu = -1;
-				errno = E2BIG;
-				break;
-			}
-			memcpy(pdata,que_body->data,que_body->length);
-			if(tail_index_old != que_head->tail_index){
-				lseek(fd,0,SEEK_SET);
-				retu = write(fd,head_buf,FILE_QUE_HEAD_SIZE);
-				if(retu == -1){
-					retu = -1;
-					break;
-				}
-			}
-			retu = que_body->length;
-			break;
-		}
-	}
-	
-	finish:
-	if(que_head->head_index > que_head->tail_index){
-		sem_union.val = HAVETRANS;
-		semctl(sem_id,0,SETVAL,sem_union);
-	}else{
-		sem_union.val = NOTRANS;
-	}
-	semctl(sem_id,0,SETVAL,sem_union);
 
-	close(fd);
-	return retu;
+	return len;
 }
-///////////////////////////////以上是信号量////////////////////////////////////////////////////////////
-
-///////////////////////////////以下是fifo////////////////////////////////////////////////////////////
-ssize_t write_file_que_timedwait_fifo(const char* filename, void *pdata, size_t len, int timeout){
-	struct flock lock = {F_WRLCK,SEEK_SET,0,0};
-	struct flock unlock = {F_UNLCK,SEEK_SET,0,0};
-
-	ssize_t retu = -1;
-	struct stat filestat;
-	file_que_head *que_head;
-	file_que_body *que_body;
-	unsigned char head_buf[FILE_QUE_HEAD_SIZE] = {0};
-	unsigned char body_buf[FILE_QUE_BODY_SIZE] = {0};
-	que_head = (file_que_head*)head_buf;
-	que_body = (file_que_body*)body_buf;
-	int fd,fifofd;
-	char *fifo_filename=NULL;
-
-	if(filename == NULL){
-		return -1;
-	}
-
-	//pdata太长
-	if(len > FILE_QUE_BODY_SIZE-sizeof(file_que_body)){
-		return -1;
-	}
-	
-	fd = open(filename,O_RDWR|O_CREAT,0664);
-	if(fd == -1)
-		return -1;
-
-	//创建fifo
-	fifo_filename = malloc(strlen(filename) + 6);
-	sprintf(fifo_filename,"%s.fifo",filename);
-	fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
-	if(fifofd == -1){
-		//fifo不存在, 创建fifo
-		//锁文件
-		fcntl(fd,F_SETLKW,&lock);
-		fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
-		if(fifofd == -1){
-			mkfifo(fifo_filename,0664);
-			fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
-		}
-		//解锁文件
-		fcntl(fd,F_SETLKW,&unlock);
-	}
-	free(fifo_filename);
-
-	if(fifofd == -1){
-		close(fd);
-		return -1;
-	}
-
-	//锁文件
-	fcntl(fd,F_SETLKW,&lock);
-
-	//通知
-	write(fifofd,"\x00",1);
-
-	//文件长度
-	fstat(fd,&filestat);
-	//读头
-	if(filestat.st_size >= FILE_QUE_HEAD_SIZE){
-		lseek(fd,0,SEEK_SET);
-		read(fd,head_buf,FILE_QUE_HEAD_SIZE);
-	}
-	//脏文件,清空
-	if(filestat.st_size<FILE_QUE_HEAD_SIZE 
-		||que_head->head_index<que_head->tail_index 
-		|| FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE != filestat.st_size
-	){
-		que_head->head_index = que_head->tail_index = 0;
-		//ftruncate(fd,0);
-	}
-	//追加数据
-	que_body->length = len;
-	memcpy(que_body->data,pdata,len);
-	retu = lseek(fd,FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE,SEEK_SET);
-	if(retu == -1){
-		retu = -1;
-		goto finish;
-	}
-	retu = write(fd,body_buf,FILE_QUE_BODY_SIZE);
-	if(retu == -1){
-		retu = -1;
-		goto finish;
-	}
-	//更新头
-	que_head->head_index++;
-	lseek(fd,0,SEEK_SET);
-	retu = write(fd,head_buf,FILE_QUE_HEAD_SIZE);
-	if(retu == -1){
-		retu = -1;
-		goto finish;
-	}
-	retu = len;
-
-	finish:
-	//解锁
-	fcntl(fd,F_SETLKW,&unlock);
-	close(fifofd);
-	close(fd);
-	return retu;
-}
-
-ssize_t read_file_que_timedwait_fifo(const char* filename, void *pdata, size_t len, int timeout){
-	struct flock lock = {F_WRLCK,SEEK_SET,0,0};
-	struct flock unlock = {F_UNLCK,SEEK_SET,0,0};
-
-	ssize_t retu = -1;
-	struct stat filestat;
-	file_que_head *que_head;
-	file_que_body *que_body;
-	unsigned char head_buf[FILE_QUE_HEAD_SIZE] = {0};
-	unsigned char body_buf[FILE_QUE_BODY_SIZE] = {0};
-	que_head = (file_que_head*)head_buf;
-	que_body = (file_que_body*)body_buf;
-	int fd,fifofd;
-	char *fifo_filename=NULL;
-	uint64_t now,expire;
-	unsigned char tmp[10] = {0};
-
-	if(filename == NULL){
-		return -1;
-	}
-
-	fd = open(filename,O_RDWR|O_CREAT,0664);
-	if(fd == -1){
-		return -1;
-	}
-
-	//创建fifo
-	fifo_filename = malloc(strlen(filename) + 6);
-	sprintf(fifo_filename,"%s.fifo",filename);
-	fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
-	if(fifofd == -1){
-		//fifo不存在, 创建fifo
-		//锁文件
-		fcntl(fd,F_SETLKW,&lock);
-		fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
-		if(fifofd == -1){
-			mkfifo(fifo_filename,0664);
-			fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
-		}
-		//解锁文件
-		fcntl(fd,F_SETLKW,&unlock);
-	}
-	free(fifo_filename);
-
-	if(fifofd == -1){
-		close(fd);
-		return -1;
-	}
-
-	_localtime(&now);
-	if(timeout < 0){
-		expire = -1;
-	}else{
-		expire = now + timeout * 1000000;
-	}
-	
-	while(now <= expire){
-		memset(head_buf,0,sizeof(head_buf));
-		//加锁
-		fcntl(fd,F_SETLKW,&lock);
-		//文件长度
-		fstat(fd,&filestat);
-		//读头
-		if(filestat.st_size >= FILE_QUE_HEAD_SIZE){
-			lseek(fd,0,SEEK_SET);
-			read(fd,head_buf,FILE_QUE_HEAD_SIZE);
-		}
-		//脏文件,清空
-		if(filestat.st_size<FILE_QUE_HEAD_SIZE 
-			||que_head->head_index<que_head->tail_index 
-			|| FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE != filestat.st_size
-		){
-			que_head->head_index = que_head->tail_index = 0;
-			ftruncate(fd,0);
-		}
-		//有数据
-		if(que_head->head_index > que_head->tail_index){
-			//先偏移
-			retu = lseek(fd,FILE_QUE_HEAD_SIZE + que_head->tail_index * FILE_QUE_BODY_SIZE,SEEK_SET);
-			if(retu == -1){
-				retu = -1;
-				break;
-			}
-			//有数据
-			while(que_head->head_index > que_head->tail_index){
-				retu = read(fd,body_buf,FILE_QUE_BODY_SIZE);
-				if(retu == -1){
-					retu = -1;
-					break;
-				}
-				if(retu != FILE_QUE_BODY_SIZE){
-					retu = -1;
-					break;
-				}
-				if(que_body->length > FILE_QUE_BODY_SIZE-sizeof(file_que_head)){
-					//脏数据, 继续读
-					retu = -1;
-					que_head->tail_index++;
-					continue;
-				}
-				if(que_body->length > len){
-					//pdata不够长
-					retu = -1;
-					errno = E2BIG;
-					break;
-				}
-				memcpy(pdata,que_body->data,que_body->length);
-
-				que_head->tail_index++;
-				if(que_head->head_index == que_head->tail_index){
-					//队列为空, 清空文件
-					que_head->head_index = que_head->tail_index = 0;
-					ftruncate(fd,0);
-				}else{
-					lseek(fd,0,SEEK_SET);
-					retu = write(fd,head_buf,FILE_QUE_HEAD_SIZE);
-					if(retu == -1){
-						retu = -1;
-						break;
-					}
-				}
-				retu = que_body->length;
-				break;
-			}
-		}
-		//解锁
-		fcntl(fd,F_SETLKW,&unlock);
-
-		//取到数据或者读数据有某些问题的，可以返回了
-		if(retu >= 0 || que_head->head_index > que_head->tail_index){
-			break;
-		}
-		//队列为空
-		if(now >= expire){
-			retu = -1;
-			break;
-		}
-
-		//无数据,则用fifo+select等待文件写入
-		struct timeval tv,*tv_p;
-		if(timeout < 0){
-			tv_p = NULL;
-		}else{
-			tv_p = &tv;
-			tv_p->tv_sec = (expire - now) / 1000000;
-			tv_p->tv_usec = (expire - now) % 1000000;
-		}
-
-		fd_set rset;
-		FD_ZERO(&rset);
-		FD_SET(fifofd,&rset);
-		int n = select(fifofd+1,&rset,NULL,NULL,tv_p);
-		
-		if(n == 0){
-			//timeout
-			errno = ETIME;
-			retu = -1;
-			break;
-		}else if(n == -1){
-			//signal or other
-			retu = -1;
-			break;
-		}else{
-			//继续读文件
-			read(fifofd,tmp,1);
-		}
-		_localtime(&now);
-	}
-	close(fifofd);
-	close(fd);
-	return retu;
-}
-
-ssize_t peek_file_que_timedwait_fifo(const char* filename, void *pdata, size_t len, int timeout){
-	struct flock lock = {F_WRLCK,SEEK_SET,0,0};
-	struct flock unlock = {F_UNLCK,SEEK_SET,0,0};
-
-	ssize_t retu = -1;
-	struct stat filestat;
-	file_que_head *que_head;
-	file_que_body *que_body;
-	unsigned char head_buf[FILE_QUE_HEAD_SIZE] = {0};
-	unsigned char body_buf[FILE_QUE_BODY_SIZE] = {0};
-	que_head = (file_que_head*)head_buf;
-	que_body = (file_que_body*)body_buf;
-	int fd,fifofd;
-	char *fifo_filename=NULL;
-	uint64_t now,expire;
-	unsigned char tmp[10] = {0};
-
-	if(filename == NULL){
-		return -1;
-	}
-
-	fd = open(filename,O_RDWR|O_CREAT,0664);
-	if(fd == -1){
-		return -1;
-	}
-
-	//创建fifo
-	fifo_filename = malloc(strlen(filename) + 6);
-	sprintf(fifo_filename,"%s.fifo",filename);
-	fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
-	if(fifofd == -1){
-		//fifo不存在, 创建fifo
-		//锁文件
-		fcntl(fd,F_SETLKW,&lock);
-		fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
-		if(fifofd == -1){
-			mkfifo(fifo_filename,0664);
-			fifofd = open(fifo_filename,O_RDWR|O_NONBLOCK);
-		}
-		//解锁文件
-		fcntl(fd,F_SETLKW,&unlock);
-	}
-	free(fifo_filename);
-
-	if(fifofd == -1){
-		close(fd);
-		return -1;
-	}
-
-	_localtime(&now);
-	if(timeout < 0){
-		expire = -1;
-	}else{
-		expire = now + timeout * 1000000;
-	}
-
-	while(now <= expire){
-		memset(head_buf,0,sizeof(head_buf));
-		//加锁
-		fcntl(fd,F_SETLKW,&lock);
-		//文件长度
-		fstat(fd,&filestat);
-		//读头
-		if(filestat.st_size >= FILE_QUE_HEAD_SIZE){
-			lseek(fd,0,SEEK_SET);
-			read(fd,head_buf,FILE_QUE_HEAD_SIZE);
-		}
-		//脏文件,清空
-		if(filestat.st_size<FILE_QUE_HEAD_SIZE 
-			||que_head->head_index<que_head->tail_index 
-			|| FILE_QUE_HEAD_SIZE + que_head->head_index * FILE_QUE_BODY_SIZE != filestat.st_size
-		){
-			que_head->head_index = que_head->tail_index = 0;
-			ftruncate(fd,0);
-		}
-		//有数据
-		size_t tail_index_old = que_head->tail_index;
-		if(que_head->head_index > que_head->tail_index){
-			//先偏移
-			retu = lseek(fd,FILE_QUE_HEAD_SIZE + que_head->tail_index * FILE_QUE_BODY_SIZE,SEEK_SET);
-			if(retu == -1){
-				retu = -1;
-				break;
-			}
-			//有数据
-			while(que_head->head_index > que_head->tail_index){
-				retu = read(fd,body_buf,FILE_QUE_BODY_SIZE);
-				if(retu == -1){
-					retu = -1;
-					break;
-				}
-				if(retu != FILE_QUE_BODY_SIZE){
-					retu = -1;
-					break;
-				}
-				if(que_body->length > FILE_QUE_BODY_SIZE-sizeof(file_que_head)){
-					//脏数据, 继续读
-					retu = -1;
-					que_head->tail_index++;
-					continue;
-				}
-				if(que_body->length > len){
-					//pdata不够长
-					retu = -1;
-					errno = E2BIG;
-					break;
-				}
-				memcpy(pdata,que_body->data,que_body->length);
-				if(tail_index_old != que_head->tail_index){
-					lseek(fd,0,SEEK_SET);
-					retu = write(fd,head_buf,FILE_QUE_HEAD_SIZE);
-					if(retu == -1){
-						retu = -1;
-						break;
-					}
-				}
-				retu = que_body->length;
-				break;
-			}
-		}
-		//解锁
-		fcntl(fd,F_SETLKW,&unlock);
-
-		//取到数据或者读数据有某些问题的，可以返回了
-		if(retu >= 0 || que_head->head_index > que_head->tail_index){
-			break;
-		}
-		//队列为空
-		if(now >= expire){
-			retu = -1;
-			break;
-		}
-
-		//无数据,则用fifo+select等待文件写入
-		struct timeval tv,*tv_p;
-		if(timeout < 0){
-			tv_p = NULL;
-		}else{
-			tv_p = &tv;
-			tv_p->tv_sec = (expire - now) / 1000000;
-			tv_p->tv_usec = (expire - now) % 1000000;
-		}
-
-		fd_set rset;
-		FD_ZERO(&rset);
-		FD_SET(fifofd,&rset);
-		int n = select(fifofd+1,&rset,NULL,NULL,tv_p);
-		
-		if(n == 0){
-			//timeout
-			errno = ETIME;
-			retu = -1;
-			break;
-		}else if(n == -1){
-			//signal or other
-			retu = -1;
-			break;
-		}else{
-			//继续读文件
-			read(fifofd,tmp,1);
-		}
-		_localtime(&now);
-	}
-	close(fifofd);
-	close(fd);
-	return retu;
-}
-///////////////////////////////以上是fifo////////////////////////////////////////////////////////////
